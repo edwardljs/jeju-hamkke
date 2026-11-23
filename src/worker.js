@@ -1,14 +1,16 @@
 // 제주도 함께가기 — 실시간 중계 서버 (Cloudflare Worker + Durable Object)
 // 게임 화면(index.html)은 public 폴더에서 그대로 보내 주고, /ws 로 들어온 웹소켓은 Hub 하나가 받아서
-// 방(최대 30명)을 나눠 주고, 같은 방 사람들의 상태(위치·모습·말풍선)를 서로에게 전해 준다. 아무것도 저장하지 않는다.
+// 접속한 모두를 같은 방(1번)에 넣고, 같은 방 사람들의 상태(위치·모습·말풍선)를 서로에게 전해 준다. 아무것도 저장하지 않는다.
 import { DurableObject } from 'cloudflare:workers';
 
-const ROOM_MAX = 30;
+const ROOM = 1;          // 방을 나누지 않는다
+const IDLE_MS = 45000;   // 45초 동안 소식이 없으면(창을 닫았는데 연결만 남은 경우) 정리
 const MAX_STATE = 4096;
 
 export class Hub extends DurableObject {
   constructor(ctx, env) {
     super(ctx, env);
+    this.n = 0;
     this.ctx.setWebSocketAutoResponse(new WebSocketRequestResponsePair('ping', 'pong'));
   }
   async fetch(req) {
@@ -27,18 +29,22 @@ export class Hub extends DurableObject {
     let m; try { m = JSON.parse(msg); } catch { return; }
     const a = ws.deserializeAttachment() || {};
     if (m.t === 'join' && !a.room) {
-      const counts = {};
-      for (const x of this.all()) if (x.a.room) counts[x.a.room] = (counts[x.a.room] || 0) + 1;
-      let k = 1; while ((counts[k] || 0) >= ROOM_MAX) k++;
-      a.room = k; a.s = clean(m.s); ws.serializeAttachment(a);
+      this.prune();
+      const k = ROOM;
+      a.room = k; a.s = clean(m.s); a.seen = Date.now(); ws.serializeAttachment(a);
       const others = this.inRoom(k).filter(x => x.ws !== ws);
       this.send(ws, { t: 'room', room: k, peers: others.map(x => ({ peer: x.a.peer, s: x.a.s })) });
       for (const x of others) this.send(x.ws, { t: 'up', peer: a.peer, s: a.s });
     } else if (m.t === 'p' && a.room) {
-      a.s = clean(m.s); ws.serializeAttachment(a);
+      a.s = clean(m.s); a.seen = Date.now(); ws.serializeAttachment(a);
+      if (++this.n % 200 === 0) this.prune();
       const out = JSON.stringify({ t: 'up', peer: a.peer, s: a.s });
       for (const x of this.inRoom(a.room)) if (x.ws !== ws) { try { x.ws.send(out); } catch {} }
     }
+  }
+  prune() {
+    const now = Date.now();
+    for (const x of this.all()) if (x.a.room && now - (x.a.seen || now) > IDLE_MS) this.leave(x.ws);
   }
   async webSocketClose(ws) { this.leave(ws); }
   async webSocketError(ws) { this.leave(ws); }
